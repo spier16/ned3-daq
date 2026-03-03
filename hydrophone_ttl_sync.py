@@ -69,11 +69,25 @@ current_recording_file = None
 _ai_restart_event   = threading.Event()   # main thread → acq thread: rebuild now
 _ai_restarted_event = threading.Event()   # acq thread → main thread: new task live
 
-# Hardware sample counter — incremented by acquisition_thread for every chunk
-# sent to the write queue.  Read by _do_fire_trigger() to cross-check the CI
-# tick-derived fractional_sample_index against what actually reached the CSV.
-_hw_samples_written = 0
-_hw_samples_lock    = threading.Lock()
+# Sample accounting — all three variables are protected by _hw_samples_lock.
+#
+#   _ai_samples_acquired : total samples read from hardware since the last AI
+#                          task restart, regardless of recording state.
+#                          Reset to 0 at the start of each AI task.
+#
+#   _csv_start_offset    : hardware sample index of CSV row 0.  Set the first
+#                          time a recording chunk is queued; None until then.
+#                          Lets post-processing map a trigger to a CSV row:
+#                            trigger_csv_row = fractional_sample_index
+#                                           - csv_time0_hardware_sample_index
+#
+#   _hw_samples_written  : samples for which a write was attempted (including
+#                          chunks dropped by a full queue).  Used as a second
+#                          cross-check alongside fractional_sample_index.
+_ai_samples_acquired = 0
+_csv_start_offset    = None
+_hw_samples_written  = 0
+_hw_samples_lock     = threading.Lock()
 
 # Live-plot trigger annotations.
 trigger_events    = []
@@ -174,12 +188,13 @@ def _create_and_arm_ci_task():
     ci_ch.ci_count_edges_term = "/cDAQ3/80MHzTimebase"
 
     # Latch the count on the rising edge of the CO pulse (one trigger per session).
-    # samps_per_chan=2: DAQmx requires a minimum buffer of 2 for clocked CI tasks;
-    # we only fire the trigger once so only the first slot is ever used.
+    # CONTINUOUS mode: stopping the task early (at recording end) does not generate
+    # DaqWarning 200010, which FINITE mode raises when samps_per_chan > triggers fired.
+    # samps_per_chan=2: DAQmx requires a minimum buffer of 2 for clocked CI tasks.
     ci.timing.cfg_samp_clk_timing(
         rate=100,                               # nominal; real clock is ctr0 output
         source="/cDAQ3/Ctr0InternalOutput",     # internal route — no external cable
-        sample_mode=AcquisitionType.FINITE,
+        sample_mode=AcquisitionType.CONTINUOUS,
         samps_per_chan=2,
     )
 
@@ -202,6 +217,10 @@ def _write_sync_json(recording_filepath):
             "start_utc":      t_ai_start_wall.isoformat() if t_ai_start_wall else None,
             "sample_rate_hz": SAMPLE_RATE,
             "channel":        CHANNEL,
+            # Hardware sample index of CSV row 0.  The trigger maps to CSV via:
+            #   trigger_csv_row = fractional_sample_index
+            #                   - csv_time0_hardware_sample_index
+            "csv_time0_hardware_sample_index": _csv_start_offset,
         },
         "hardware": {
             "chassis":           "cDAQ3",
@@ -226,11 +245,15 @@ def acquisition_thread():
     This restart is what lets the CI task arm-start in sync with the AI task at
     the beginning of each recording.
     """
-    global t_ai_start_perf, t_ai_start_wall, plot_buffer, _hw_samples_written
+    global t_ai_start_perf, t_ai_start_wall, plot_buffer
+    global _hw_samples_written, _ai_samples_acquired, _csv_start_offset
 
     while not stop_event.is_set():
         _ai_restarted_event.clear()
         _ai_restart_event.clear()
+        # Reset hardware sample counter for this AI task lifetime.
+        with _hw_samples_lock:
+            _ai_samples_acquired = 0
 
         with nidaqmx.Task() as ai_task:
             ch = ai_task.ai_channels.add_ai_voltage_chan(
@@ -275,9 +298,17 @@ def acquisition_thread():
                     plot_buffer = np.roll(plot_buffer, -len(samples))
                     plot_buffer[-len(samples):] = samples
 
-                if recording:
-                    with _hw_samples_lock:
+                # Capture recording flag once; GIL makes bool reads atomic.
+                currently_recording = recording
+                with _hw_samples_lock:
+                    _ai_samples_acquired += len(samples)
+                    if currently_recording:
                         _hw_samples_written += len(samples)
+                        if _csv_start_offset is None:
+                            # First chunk of this recording — mark CSV row 0.
+                            _csv_start_offset = _ai_samples_acquired - len(samples)
+
+                if currently_recording:
                     try:
                         write_queue.put_nowait(("data", samples))
                     except queue.Full:
@@ -383,8 +414,12 @@ def _do_fire_trigger():
         "fractional_sample_index":      frac_sample,
         "nearest_sample_index":         nearest_sample,
         "subsample_offset_us":          subsample_us,
-        # Cross-check: should equal fractional_sample_index within ±BUFFER_SIZE.
-        # A larger discrepancy means write_queue drops occurred before the trigger.
+        # Cross-check: (fractional_sample_index - hardware_samples_read_at_trigger)
+        # should equal csv_time0_hardware_sample_index within ±BUFFER_SIZE.
+        # A larger residual means samples were discarded at recording start
+        # (recording flag was set after the first chunk completed — rare).
+        # NOTE: write_queue drops cannot be detected here; both this counter and
+        # fractional_sample_index are unaffected by queue drops.
         "hardware_samples_read_at_trigger": hw_samples_at_trigger,
     }
 
@@ -403,7 +438,8 @@ def _do_fire_trigger():
 # ── Recording toggle ───────────────────────────────────────────────────────────
 def toggle_recording(event):
     global recording, current_recording_file, _ci_task
-    global t_ci_start_perf, trigger_used, trigger_result, _hw_samples_written
+    global t_ci_start_perf, trigger_used, trigger_result
+    global _hw_samples_written, _csv_start_offset
 
     if not recording:
         # ── Start recording ────────────────────────────────────────────────────
@@ -429,8 +465,10 @@ def toggle_recording(event):
         t_ci_start_perf = t_ai_start_perf
 
         # 3. Reset per-recording state.
+        # _ai_samples_acquired is reset by acquisition_thread on AI task restart.
         with _hw_samples_lock:
             _hw_samples_written = 0
+            _csv_start_offset   = None
         trigger_used   = False
         trigger_result = None
         with _trig_events_lock:
