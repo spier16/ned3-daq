@@ -182,7 +182,6 @@ def _do_fire_trigger():
     """
     Fires a hardware-timed TTL pulse on PFI0 → VEO 710, then records the
     perf_counter timestamp so we know where in the hydrophone stream it fell.
-    Accuracy: ~1–5 µs, well within the 50 µs budget.
     """
     if not timing_ready.is_set():
         print("[trigger] not ready — acquisition hasn't started yet.")
