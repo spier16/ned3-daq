@@ -1,8 +1,31 @@
+# ── Validation copy of hydrophone_ttl_sync.py ──────────────────────────────────
+#
+# Purpose: verify that the hardware CI timestamp (fractional_sample_index) and
+# the AI analog recording share the same time zero, using an NI 9775 as a
+# high-rate ADC that directly records the TTL pulse on PFI0.
+#
+# Setup:
+#   - NI 9775 on cDAQ3Mod3, channel ai3 (RSE)
+#   - BNC T-splitter on PFI0: one leg to VEO 710 camera, one leg to 9775 ai3
+#   - NI 9230 removed from chassis for this test
+#
+# Validation:
+#   After a recording, open the CSV and find the sample where the voltage
+#   crosses ~1.5 V (midpoint of TTL high level).  That sample index is the
+#   "measured" trigger row.  The "predicted" row from the sync JSON is:
+#
+#       predicted_csv_row = fractional_sample_index
+#                         - csv_time0_hardware_sample_index
+#
+#   Residual = predicted - measured, expressed in µs = residual / SAMPLE_RATE * 1e6.
+#   A good result is |residual| < 2 samples (< 20 µs at 100 kHz).
+# ───────────────────────────────────────────────────────────────────────────────
+
 import json
 
 import nidaqmx
 from nidaqmx.constants import (
-    AcquisitionType, TerminalConfiguration, ExcitationSource, Coupling,
+    AcquisitionType, TerminalConfiguration, Coupling,
     TriggerType, Edge,
 )
 import numpy as np
@@ -16,13 +39,18 @@ import time
 from datetime import datetime
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-CHANNEL         = "cDAQ3Mod7/ai2"   # hydrophone AI channel
-SAMPLE_RATE     = 12800              # Hz  (NI 9230 maximum)
-BUFFER_SIZE     = 1280               # samples per read (100 ms chunks)
-VOLTAGE_RANGE   = 5                  # ±5 V
-IEPE_ENABLED    = False
-PLOT_WINDOW     = 1.0                # seconds of data shown live
+CHANNEL         = "cDAQ3Mod3/ai3"   # NI 9775 channel receiving the TTL pulse
+SAMPLE_RATE     = 1_000_000            # Hz — high enough to resolve TTL edge
+BUFFER_SIZE     = 500_000             # samples per read
+VOLTAGE_RANGE   = 5                  # ±5 V (TTL swings 0–3.3 V or 0–5 V)
+PLOT_WINDOW     = 1                # seconds of data shown live (50 k samples)
 WRITE_DIR       = r"C:\Users\sapierso\Desktop"
+READ_TIMEOUT_INITIAL_S = 0.5         # baseline minimum read timeout
+READ_TIMEOUT_CUSHION_S = 0.1         # extra time beyond one chunk fill duration
+READ_TIMEOUT_S         = max(
+    READ_TIMEOUT_INITIAL_S,
+    (BUFFER_SIZE / SAMPLE_RATE) + READ_TIMEOUT_CUSHION_S,
+)
 
 # ── Counter / trigger config ───────────────────────────────────────────────────
 COUNTER_OUT_CHAN = "cDAQ3/ctr0"      # pulse generator  → camera trigger
@@ -31,9 +59,9 @@ TRIGGER_TERMINAL = "/cDAQ3/PFI0"     # BNC output → VEO 710 trigger input
 PULSE_HIGH_TIME  = 1.0               # pulse width (s)
 
 # ── Timebase / rollover constants ──────────────────────────────────────────────
-TIMEBASE_HZ      = 80_000_000
-TICKS_PER_SAMPLE = TIMEBASE_HZ // SAMPLE_RATE   # 6250 ticks per AI sample
-TICKS_ROLLOVER   = 2**32
+TIMEBASE_HZ       = 80_000_000
+TICKS_PER_SAMPLE  = TIMEBASE_HZ // SAMPLE_RATE   # 800 ticks per AI sample at 100 kHz
+TICKS_ROLLOVER    = 2**32
 ROLLOVER_PERIOD_S = TICKS_ROLLOVER / TIMEBASE_HZ  # ≈ 53.69 s
 OVERRUN_ERROR_CODES = {
     -200279,  # Application not keeping up with acquisition.
@@ -47,6 +75,24 @@ write_queue      = queue.Queue(maxsize=200)
 plot_buffer      = np.zeros(int(SAMPLE_RATE * PLOT_WINDOW))
 buffer_lock      = threading.Lock()
 stop_event       = threading.Event()
+
+
+def validate_runtime_config():
+    plot_len = len(plot_buffer)
+    if BUFFER_SIZE > plot_len:
+        min_plot_window_s = BUFFER_SIZE / SAMPLE_RATE
+        raise ValueError(
+            "Invalid configuration: BUFFER_SIZE exceeds live plot buffer length.\n"
+            f"BUFFER_SIZE={BUFFER_SIZE} samples\n"
+            f"plot_buffer length={plot_len} samples (SAMPLE_RATE * PLOT_WINDOW)\n"
+            "Change one of these settings:\n"
+            f"- Decrease BUFFER_SIZE to <= {plot_len}\n"
+            f"- Increase PLOT_WINDOW to >= {min_plot_window_s:.6f} s "
+            f"(currently {PLOT_WINDOW:.6f} s)"
+        )
+
+
+validate_runtime_config()
 
 # Set by acquisition_thread immediately after ai_task.start().
 # Safe to read from any thread after timing_ready is set.
@@ -121,7 +167,7 @@ def writer_thread():
             try:
                 csv_file = open(filepath, "w")
                 csv_file.write(
-                    f"# hydrophone recording\n"
+                    f"# TTL sync validation recording (NI 9775)\n"
                     f"# file_start_utc  : {wall_dt_str}\n"
                     f"# sample_rate_hz  : {SAMPLE_RATE}\n"
                     f"# channel         : {CHANNEL}\n"
@@ -228,11 +274,11 @@ def _write_sync_json(recording_filepath):
             "csv_time0_hardware_sample_index": _csv_start_offset,
         },
         "hardware": {
-            "chassis":           "cDAQ3",
-            "co_counter":        COUNTER_OUT_CHAN,
-            "ci_counter":        COUNTER_IN_CHAN,
-            "trigger_terminal":  TRIGGER_TERMINAL,
-            "timebase_hz":       TIMEBASE_HZ,
+            "chassis":             "cDAQ3",
+            "co_counter":          COUNTER_OUT_CHAN,
+            "ci_counter":          COUNTER_IN_CHAN,
+            "trigger_terminal":    TRIGGER_TERMINAL,
+            "timebase_hz":         TIMEBASE_HZ,
             "ticks_per_ai_sample": TICKS_PER_SAMPLE,
         },
         "trigger": trigger_result if trigger_result is not None else {"fired": False},
@@ -261,16 +307,13 @@ def acquisition_thread():
             _ai_samples_acquired = 0
 
         with nidaqmx.Task() as ai_task:
-            ch = ai_task.ai_channels.add_ai_voltage_chan(
+            ai_task.ai_channels.add_ai_voltage_chan(
                 CHANNEL,
-                terminal_config=TerminalConfiguration.PSEUDO_DIFF,
+                terminal_config=TerminalConfiguration.RSE,   # NI 9775 uses RSE
                 min_val=-VOLTAGE_RANGE,
                 max_val=VOLTAGE_RANGE,
             )
-            ch.ai_coupling = Coupling.AC
-            if IEPE_ENABLED:
-                ch.ai_excit_src = ExcitationSource.INTERNAL
-                ch.ai_excit_val = 0.004
+            # NI 9775 is DC coupled — no coupling property to set.
 
             ai_task.timing.cfg_samp_clk_timing(
                 rate=SAMPLE_RATE,
@@ -287,13 +330,17 @@ def acquisition_thread():
             _ai_restarted_event.set()   # unblocks toggle_recording()
 
             print(f"[acq] task live | start: {t_ai_start_wall.isoformat()}")
+            print(
+                f"[acq] read timeout = {READ_TIMEOUT_S:.3f} s "
+                f"(chunk fill ~= {BUFFER_SIZE / SAMPLE_RATE:.3f} s)"
+            )
 
             while not stop_event.is_set() and not _ai_restart_event.is_set():
                 try:
                     samples = np.array(
                         ai_task.read(
                             number_of_samples_per_channel=BUFFER_SIZE,
-                            timeout=0.5,
+                            timeout=READ_TIMEOUT_S,
                         )
                     )
                 except nidaqmx.errors.DaqReadError as e:
@@ -407,7 +454,7 @@ def _do_fire_trigger():
 
     # Snapshot the software sample counter immediately after reading the latch.
     # Used to cross-check fractional_sample_index: if they differ by more than
-    # one buffer's worth (~1280), samples were dropped by the write queue.
+    # one buffer's worth (~10000), samples were dropped by the write queue.
     with _hw_samples_lock:
         hw_samples_at_trigger = _hw_samples_written
 
@@ -501,7 +548,7 @@ def toggle_recording(event):
 
         # 4. Open CSV.
         current_recording_file = os.path.join(
-            WRITE_DIR, datetime.now().strftime("hydrophone_%Y%m%d_%H%M%S.csv")
+            WRITE_DIR, datetime.now().strftime("ttl_validation_%Y%m%d_%H%M%S.csv")
         )
         write_queue.put(("start", current_recording_file, t_ai_start_wall.isoformat()))
         recording = True
@@ -556,7 +603,7 @@ ax.set_xlim(-PLOT_WINDOW, 0)
 ax.set_ylim(-VOLTAGE_RANGE, VOLTAGE_RANGE)
 ax.set_xlabel("Time (s)")
 ax.set_ylabel("Amplitude (V)")
-ax.set_title("Hydrophone — Live Waveform")
+ax.set_title("9775 TTL Validation — Live Waveform")
 ax.grid(True, alpha=0.3)
 
 _plot_start_time    = time.time()
@@ -578,7 +625,7 @@ def animate(_):
     elapsed = time.time() - _plot_start_time
     h, rem  = divmod(int(elapsed), 3600)
     m, s    = divmod(rem, 60)
-    ax.set_title(f"Hydrophone — Live Waveform    {h:02d}:{m:02d}:{s:02d}")
+    ax.set_title(f"9775 TTL Validation — Live Waveform    {h:02d}:{m:02d}:{s:02d}")
 
     with _trig_events_lock:
         new_events          = trigger_events[_last_trigger_count:]

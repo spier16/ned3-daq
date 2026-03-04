@@ -20,6 +20,11 @@ VOLTAGE_RANGE = 5                 # voltage range (±5 V in AC coupling mode)
 IEPE_ENABLED  = False                 # set True for hydrophones requiring IEPE excitation
 PLOT_WINDOW   = 1.0                   # seconds of data shown in live plot
 WRITE_DIR     = r"C:\Users\sapierso\Desktop"
+OVERRUN_ERROR_CODES = {
+    -200279,  # Application not keeping up with acquisition.
+    -200286,  # Samples overwritten before they were read.
+    -200361,  # Onboard device memory overflow.
+}
 
 # ── Shared state ─────────────────────────────────────────────────────────────
 recording    = False
@@ -98,9 +103,20 @@ def acquisition_thread():
         print("Acquisition started.")
 
         while not stop_event.is_set():
-            samples = np.array(
-                task.read(number_of_samples_per_channel=BUFFER_SIZE, timeout=2.0)
-            )
+            try:
+                samples = np.array(
+                    task.read(number_of_samples_per_channel=BUFFER_SIZE, timeout=2.0)
+                )
+            except nidaqmx.errors.DaqReadError as e:
+                err_code = getattr(e, "error_code", None)
+                print(f"[acq] DAQ read error (error {err_code}): {e}")
+                if err_code in OVERRUN_ERROR_CODES:
+                    stop_event.set()
+                    raise RuntimeError(
+                        f"[acq] DAQ overrun detected (error {err_code}). "
+                        f"Lower SAMPLE_RATE/BUFFER_SIZE or reduce processing load."
+                    ) from e
+                continue
 
             # Update rolling plot buffer
             with buffer_lock:
@@ -112,7 +128,11 @@ def acquisition_thread():
                 try:
                     write_queue.put_nowait(("data", samples))
                 except queue.Full:
-                    print("WARNING: Write queue full — samples dropped. Disk may be too slow.")
+                    stop_event.set()
+                    raise RuntimeError(
+                        "[acq] write queue full: samples would be dropped. "
+                        "Stopping acquisition to preserve data integrity."
+                    )
 
         print("Acquisition stopped.")
 
